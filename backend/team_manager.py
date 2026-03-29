@@ -1,8 +1,11 @@
 """
-团队管理器（s09/s10/s11 模式）
+团队管理器（s09/s10/s11 模式）— Responses API 版本
 消息总线（JSONL 收件箱）+ 队友生命周期 + 关闭协议 + 计划审批协议
+队友使用 OpenAI Responses API（同步，在独立线程中运行）。
 """
 import json
+import os
+import subprocess
 import threading
 import time
 import uuid
@@ -19,6 +22,84 @@ VALID_MSG_TYPES = {
     "plan_approval_request",
     "plan_approval_response",
 }
+
+# Responses API 格式的队友工具
+_TEAMMATE_TOOLS = [
+    {
+        "type": "function",
+        "name": "bash",
+        "description": "执行 shell 命令",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "read_file",
+        "description": "读取文件内容",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "write_file",
+        "description": "写入文件",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "send_message",
+        "description": "发送消息给团队成员",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["to", "content"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "submit_plan",
+        "description": "向 lead 提交计划等待审批，在执行风险操作前必须调用",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan": {"type": "string", "description": "计划详情"},
+            },
+            "required": ["plan"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "idle",
+        "description": "当前工作完成，进入空闲状态",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "claim_task",
+        "description": "认领一个待处理任务",
+        "parameters": {
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"}},
+            "required": ["task_id"],
+        },
+    },
+]
 
 
 class MessageBus:
@@ -79,7 +160,7 @@ class TeamManager:
         self.bus = bus
         self.task_manager = task_manager
         self.team_dir = team_dir
-        self.event_callback = event_callback  # 用于向前端推送团队事件
+        self.event_callback = event_callback
         team_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = team_dir / "config.json"
         self.config = self._load_config()
@@ -112,11 +193,17 @@ class TeamManager:
             self._save_config()
 
     def _emit(self, event: dict):
-        """向前端推送团队事件（如果有回调）。"""
         if self.event_callback:
             self.event_callback(event)
 
-    def spawn(self, name: str, role: str, prompt: str, openai_client, model: str) -> str:
+    def spawn(
+        self,
+        name: str,
+        role: str,
+        prompt: str,
+        _unused_client,  # 保持签名兼容，内部自己创建客户端
+        model: str,
+    ) -> str:
         """生成一个新的队友线程。"""
         member = self._find_member(name)
         if member:
@@ -131,7 +218,7 @@ class TeamManager:
 
         thread = threading.Thread(
             target=self._teammate_loop,
-            args=(name, role, prompt, openai_client, model),
+            args=(name, role, prompt, model),
             daemon=True,
         )
         thread.start()
@@ -140,13 +227,16 @@ class TeamManager:
         self._emit({"type": "team_event", "event": "spawned", "teammate": name, "role": role})
         return f"队友 '{name}'（角色：{role}）已生成"
 
-    def _teammate_loop(
-        self, name: str, role: str, initial_prompt: str, openai_client, model: str
-    ):
-        """队友的主循环（s09/s10/s11 模式）。"""
-        from openai import OpenAI  # 避免循环导入
+    def _teammate_loop(self, name: str, role: str, initial_prompt: str, model: str):
+        """队友的主循环（同步，在独立线程中运行，使用 Responses API）。"""
+        from openai import OpenAI
 
-        client = openai_client
+        # 队友使用同步 OpenAI 客户端（在线程中）
+        client = OpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            base_url=os.environ.get("OPENAI_BASE_URL"),
+        )
+
         team_name = self.config["team_name"]
         sys_prompt = (
             f"你是 '{name}'，角色：{role}，所属团队：{team_name}。"
@@ -154,75 +244,40 @@ class TeamManager:
             f"需要执行风险操作前，先调用 submit_plan 工具提交计划等待审批。"
         )
 
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": "执行 shell 命令",
-                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "读取文件内容",
-                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "send_message",
-                    "description": "发送消息给团队成员",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "to": {"type": "string"},
-                            "content": {"type": "string"},
-                        },
-                        "required": ["to", "content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "submit_plan",
-                    "description": "向 lead 提交计划等待审批，在执行风险操作前必须调用",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "plan": {"type": "string", "description": "计划详情"},
-                        },
-                        "required": ["plan"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "idle",
-                    "description": "当前工作完成，进入空闲状态",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "claim_task",
-                    "description": "认领一个待处理任务",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"task_id": {"type": "integer"}},
-                        "required": ["task_id"],
-                    },
-                },
-            },
-        ]
+        # Responses API input 格式
+        input_items: list[dict] = [{"role": "user", "content": initial_prompt}]
 
-        messages = [{"role": "user", "content": initial_prompt}]
+        def _call_api() -> tuple[str, list]:
+            """调用 Responses API，返回 (text_content, function_call_items)."""
+            response = client.responses.create(
+                model=model,
+                input=input_items,
+                instructions=sys_prompt,
+                tools=_TEAMMATE_TOOLS,
+            )
+            text = ""
+            calls = []
+            for item in response.output:
+                if item.type == "message":
+                    for c in item.content:
+                        if hasattr(c, "text"):
+                            text += c.text
+                    input_items.append({
+                        "id": item.id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    })
+                elif item.type == "function_call":
+                    input_items.append({
+                        "type": "function_call",
+                        "id": item.id,
+                        "call_id": item.call_id,
+                        "name": item.name,
+                        "arguments": item.arguments,
+                    })
+                    calls.append(item)
+            return text, calls
 
         while True:
             # ---- 工作阶段 ----
@@ -232,7 +287,8 @@ class TeamManager:
                 for msg in inbox:
                     if msg.get("type") == "shutdown_request":
                         req_id = msg.get("request_id", "")
-                        self.bus.send(name, "lead", "已收到关闭请求，正在清理...", "shutdown_response", {"request_id": req_id})
+                        self.bus.send(name, "lead", "已收到关闭请求，正在清理...",
+                                      "shutdown_response", {"request_id": req_id})
                         self._set_status(name, "shutdown")
                         self._emit({"type": "team_event", "event": "shutdown_complete", "teammate": name})
                         return
@@ -240,34 +296,31 @@ class TeamManager:
                         approved = msg.get("approve", False)
                         feedback = msg.get("feedback", "")
                         status_text = "已批准" if approved else "已拒绝"
-                        messages.append({"role": "user", "content": f"<plan_approval>{status_text}. 反馈: {feedback}</plan_approval>"})
+                        input_items.append({
+                            "role": "user",
+                            "content": f"<plan_approval>{status_text}. 反馈: {feedback}</plan_approval>",
+                        })
                     else:
-                        messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
+                        input_items.append({
+                            "role": "user",
+                            "content": json.dumps(msg, ensure_ascii=False),
+                        })
 
                 try:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "system", "content": sys_prompt}] + messages,
-                        tools=tools,
-                        max_tokens=4000,
-                    )
+                    _, tool_calls = _call_api()
                 except Exception as e:
                     self._emit({"type": "team_event", "event": "error", "teammate": name, "error": str(e)})
                     self._set_status(name, "shutdown")
                     return
 
-                msg_obj = response.choices[0].message
-                messages.append({"role": "assistant", "content": msg_obj.content or "", "tool_calls": [tc.model_dump() for tc in (msg_obj.tool_calls or [])]})
-
-                if response.choices[0].finish_reason != "tool_calls" or not msg_obj.tool_calls:
+                if not tool_calls:
                     break
 
                 idle_requested = False
-                tool_results = []
-                for tc in msg_obj.tool_calls:
-                    fn_name = tc.function.name
+                for tc in tool_calls:
+                    fn_name = tc.name
                     try:
-                        fn_args = json.loads(tc.function.arguments)
+                        fn_args = json.loads(tc.arguments) if tc.arguments else {}
                     except Exception:
                         fn_args = {}
 
@@ -282,10 +335,8 @@ class TeamManager:
                         req_id = str(uuid.uuid4())[:8]
                         plan_text = fn_args.get("plan", "")
                         self.plan_requests[req_id] = {"from": name, "status": "pending", "plan": plan_text}
-                        self.bus.send(
-                            name, "lead", plan_text, "plan_approval_request",
-                            {"request_id": req_id}
-                        )
+                        self.bus.send(name, "lead", plan_text, "plan_approval_request",
+                                      {"request_id": req_id})
                         self._emit({
                             "type": "team_event",
                             "event": "plan_submitted",
@@ -295,15 +346,25 @@ class TeamManager:
                         })
                         output = f"计划已提交，等待审批（request_id: {req_id}）"
                     elif fn_name == "bash":
-                        import subprocess
                         try:
-                            r = subprocess.run(fn_args["command"], shell=True, capture_output=True, text=True, timeout=30)  # noqa: S602
+                            r = subprocess.run(  # noqa: S602
+                                fn_args["command"], shell=True,
+                                capture_output=True, text=True, timeout=30
+                            )
                             output = (r.stdout + r.stderr).strip()[:5000] or "(无输出)"
                         except Exception as e:
                             output = f"错误: {e}"
                     elif fn_name == "read_file":
                         try:
-                            output = Path(fn_args["path"]).read_text()[:5000]
+                            output = Path(fn_args["path"]).read_text(encoding="utf-8")[:5000]
+                        except Exception as e:
+                            output = f"错误: {e}"
+                    elif fn_name == "write_file":
+                        try:
+                            p = Path(fn_args["path"])
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_text(fn_args["content"], encoding="utf-8")
+                            output = f"已写入 {fn_args['path']}"
                         except Exception as e:
                             output = f"错误: {e}"
                     else:
@@ -316,13 +377,13 @@ class TeamManager:
                         "tool": fn_name,
                         "output_preview": str(output)[:200],
                     })
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": str(output),
+
+                    input_items.append({
+                        "type": "function_call_output",
+                        "call_id": tc.call_id,
+                        "output": str(output),
                     })
 
-                messages.extend(tool_results)
                 if idle_requested:
                     break
 
@@ -339,11 +400,15 @@ class TeamManager:
                     for msg in inbox:
                         if msg.get("type") == "shutdown_request":
                             req_id = msg.get("request_id", "")
-                            self.bus.send(name, "lead", "已收到关闭请求", "shutdown_response", {"request_id": req_id})
+                            self.bus.send(name, "lead", "已收到关闭请求",
+                                          "shutdown_response", {"request_id": req_id})
                             self._set_status(name, "shutdown")
                             self._emit({"type": "team_event", "event": "shutdown_complete", "teammate": name})
                             return
-                        messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
+                        input_items.append({
+                            "role": "user",
+                            "content": json.dumps(msg, ensure_ascii=False),
+                        })
                     resumed = True
                     break
 
@@ -352,9 +417,12 @@ class TeamManager:
                 if unclaimed:
                     task = unclaimed[0]
                     self.task_manager.claim(task["id"], name)
-                    messages.append({
+                    input_items.append({
                         "role": "user",
-                        "content": f"<auto-claimed>任务 #{task['id']}: {task['subject']}\n{task.get('description', '')}</auto-claimed>",
+                        "content": (
+                            f"<auto-claimed>任务 #{task['id']}: {task['subject']}\n"
+                            f"{task.get('description', '')}</auto-claimed>"
+                        ),
                     })
                     self._emit({
                         "type": "team_event",

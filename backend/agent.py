@@ -1,7 +1,7 @@
 """
-主 Agent 循环
-基于 s_full.py 模式，使用 OpenAI SDK + MCP + Skills + 团队协议
-通过异步事件队列将中间步骤实时推送给前端（SSE）。
+主 Agent 循环 — Responses API 版本
+使用 OpenAI Responses API (wire_api="responses") + MCP + Skills + 团队协议
+通过异步事件回调将中间步骤实时推送给前端（SSE）
 """
 import asyncio
 import json
@@ -12,9 +12,9 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncIterator, Callable
+from typing import Callable
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from mcp_manager import MCPManager, load_mcp_configs
 from skill_loader import SkillLoader
@@ -29,7 +29,6 @@ INBOX_DIR = TEAM_DIR / "inbox"
 SKILLS_DIR = Path(os.environ.get("SKILLS_DIR", str(WORKDIR / "skills")))
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOKEN_THRESHOLD = 80000
-
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 
 
@@ -91,6 +90,23 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 def estimate_tokens(messages: list) -> int:
     return len(json.dumps(messages, default=str)) // 4
+
+
+def _to_responses_tool(chat_tool: dict) -> dict:
+    """将 Chat Completions 工具格式转换为 Responses API 工具格式。
+
+    Chat Completions: {"type":"function","function":{"name":...,"description":...,"parameters":...}}
+    Responses API:   {"type":"function","name":...,"description":...,"parameters":...}
+    """
+    if chat_tool.get("type") == "function":
+        fn = chat_tool.get("function", {})
+        return {
+            "type": "function",
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+        }
+    return chat_tool
 
 
 # ===== Todo 管理器（s03）=====
@@ -184,15 +200,249 @@ class BackgroundManager:
         return notifs
 
 
+# ===== 工具定义（Responses API 格式）=====
+def _make_builtin_tools() -> list[dict]:
+    """所有内置工具的 Responses API 格式定义。"""
+    return [
+        {
+            "type": "function",
+            "name": "bash",
+            "description": "执行 shell 命令",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "Shell 命令"}},
+                "required": ["command"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "读取文件内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer", "description": "最大行数"},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "write_file",
+            "description": "写入内容到文件",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "edit_file",
+            "description": "替换文件中的精确文本片段",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "TodoWrite",
+            "description": "更新任务清单（最多20条，只允许1条 in_progress）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                                "activeForm": {"type": "string"},
+                            },
+                            "required": ["content", "status", "activeForm"],
+                        },
+                    }
+                },
+                "required": ["items"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "task_create",
+            "description": "创建一个持久化任务",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["subject"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "task_get",
+            "description": "获取任务详情",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "integer"}},
+                "required": ["task_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "task_update",
+            "description": "更新任务状态或依赖关系",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]},
+                    "add_blocked_by": {"type": "array", "items": {"type": "integer"}},
+                    "add_blocks": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["task_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "task_list",
+            "description": "列出所有任务",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "background_run",
+            "description": "在后台线程执行命令",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                },
+                "required": ["command"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "check_background",
+            "description": "检查后台任务状态",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+            },
+        },
+        {
+            "type": "function",
+            "name": "spawn_teammate",
+            "description": "生成一个自主队友",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "prompt": {"type": "string"},
+                },
+                "required": ["name", "role", "prompt"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "list_teammates",
+            "description": "列出所有队友及其状态",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "send_message",
+            "description": "发送消息给队友",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "content": {"type": "string"},
+                    "msg_type": {
+                        "type": "string",
+                        "enum": ["message", "broadcast", "shutdown_request", "shutdown_response",
+                                 "plan_approval_request", "plan_approval_response"],
+                    },
+                },
+                "required": ["to", "content"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "read_inbox",
+            "description": "读取并清空 lead 的收件箱",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "broadcast",
+            "description": "向所有队友广播消息",
+            "parameters": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "shutdown_request",
+            "description": "优雅地请求队友关闭（s10 协议）",
+            "parameters": {
+                "type": "object",
+                "properties": {"teammate": {"type": "string"}},
+                "required": ["teammate"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "plan_approval",
+            "description": "批准或拒绝队友提交的计划（s10 协议）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string"},
+                    "approve": {"type": "boolean"},
+                    "feedback": {"type": "string"},
+                },
+                "required": ["request_id", "approve"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "compress",
+            "description": "手动压缩对话上下文",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+
 # ===== Agent Runner =====
 class AgentRunner:
     """
     主 Agent 类，持有所有子系统，提供 run() 异步方法。
-    run() 通过 emit() 发送 SSE 事件。
+    run() 通过 emit() 回调发送 SSE 事件。
+    使用 OpenAI Responses API (wire_api="responses")。
     """
 
     def __init__(self):
-        self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        self.client = AsyncOpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            base_url=os.environ.get("OPENAI_BASE_URL"),  # None = 使用默认 OpenAI
+        )
         self.todo = TodoManager()
         self.skills = SkillLoader(SKILLS_DIR)
         self.task_mgr = TaskManager(TASKS_DIR)
@@ -202,7 +452,7 @@ class AgentRunner:
             self.bus,
             self.task_mgr,
             TEAM_DIR,
-            event_callback=None,  # 在 run() 中动态绑定
+            event_callback=None,
         )
         self.mcp: MCPManager | None = None
         self._mcp_initialized = False
@@ -215,330 +465,107 @@ class AgentRunner:
             self._mcp_initialized = True
 
     def _build_tools(self) -> list[dict]:
-        """构建完整工具列表：内置工具 + MCP 工具 + skill 工具。"""
-        builtin_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": "执行 shell 命令",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"command": {"type": "string", "description": "Shell 命令"}},
-                        "required": ["command"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "读取文件内容",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "limit": {"type": "integer", "description": "最大行数"},
-                        },
-                        "required": ["path"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "description": "写入内容到文件",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "content": {"type": "string"},
-                        },
-                        "required": ["path", "content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "edit_file",
-                    "description": "替换文件中的精确文本片段",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "old_text": {"type": "string"},
-                            "new_text": {"type": "string"},
-                        },
-                        "required": ["path", "old_text", "new_text"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "TodoWrite",
-                    "description": "更新任务清单（最多20条，只允许1条 in_progress）",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "content": {"type": "string"},
-                                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                                        "activeForm": {"type": "string", "description": "进行时描述"},
-                                    },
-                                    "required": ["content", "status", "activeForm"],
-                                },
-                            }
-                        },
-                        "required": ["items"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "task_create",
-                    "description": "创建一个持久化任务",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "subject": {"type": "string"},
-                            "description": {"type": "string"},
-                        },
-                        "required": ["subject"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "task_get",
-                    "description": "获取任务详情",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"task_id": {"type": "integer"}},
-                        "required": ["task_id"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "task_update",
-                    "description": "更新任务状态或依赖关系",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": {"type": "integer"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]},
-                            "add_blocked_by": {"type": "array", "items": {"type": "integer"}},
-                            "add_blocks": {"type": "array", "items": {"type": "integer"}},
-                        },
-                        "required": ["task_id"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "task_list",
-                    "description": "列出所有任务",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "background_run",
-                    "description": "在后台线程执行命令",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string"},
-                            "timeout": {"type": "integer", "default": 120},
-                        },
-                        "required": ["command"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "check_background",
-                    "description": "检查后台任务状态",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"task_id": {"type": "string"}},
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "spawn_teammate",
-                    "description": "生成一个自主队友",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "role": {"type": "string"},
-                            "prompt": {"type": "string"},
-                        },
-                        "required": ["name", "role", "prompt"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_teammates",
-                    "description": "列出所有队友及其状态",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "send_message",
-                    "description": "发送消息给队友",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "to": {"type": "string"},
-                            "content": {"type": "string"},
-                            "msg_type": {
-                                "type": "string",
-                                "enum": ["message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_request", "plan_approval_response"],
-                                "default": "message",
-                            },
-                        },
-                        "required": ["to", "content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_inbox",
-                    "description": "读取并清空 lead 的收件箱",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "broadcast",
-                    "description": "向所有队友广播消息",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"content": {"type": "string"}},
-                        "required": ["content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "shutdown_request",
-                    "description": "优雅地请求队友关闭（s10 协议）",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"teammate": {"type": "string"}},
-                        "required": ["teammate"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "plan_approval",
-                    "description": "批准或拒绝队友提交的计划（s10 协议）",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "request_id": {"type": "string"},
-                            "approve": {"type": "boolean"},
-                            "feedback": {"type": "string", "default": ""},
-                        },
-                        "required": ["request_id", "approve"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "compress",
-                    "description": "手动压缩对话上下文",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-        ]
+        """构建完整工具列表（Responses API 格式）。"""
+        tools = _make_builtin_tools()
 
         # Skill 工具
-        if self.skills.list_names():
-            builtin_tools.append(self.skills.as_openai_tool())
+        skill_names = self.skills.list_names()
+        if skill_names:
+            tools.append({
+                "type": "function",
+                "name": "load_skill",
+                "description": "按名称加载专项技能的完整内容，注入到对话上下文中",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "enum": skill_names,
+                            "description": "要加载的技能名称",
+                        }
+                    },
+                    "required": ["name"],
+                },
+            })
 
-        # MCP 工具
+        # MCP 工具（已是 Responses API 格式）
         if self.mcp:
-            builtin_tools.extend(self.mcp.tools)
+            tools.extend(self.mcp.tools)
 
-        return builtin_tools
+        return tools
 
     def _build_system_prompt(self) -> str:
         return f"""你是一个全功能 AI Agent，工作目录：{WORKDIR}。
 
 使用工具完成任务。优先使用 task_create/task_list 管理多步骤工作，用 TodoWrite 管理短清单。
 需要专项知识时使用 load_skill 加载技能。
+
 可用技能：
 {self.skills.descriptions()}
 
 MCP 工具可直接调用（来自外部 MCP 服务器）。
-生成队友时使用 spawn_teammate，风险操作前队友需提交计划审批。"""
+生成队友时使用 spawn_teammate，队友执行风险操作前需提交计划审批。"""
 
-    async def _compress(self, messages: list) -> list:
-        """自动压缩对话上下文（s06）。"""
+    def _convert_history_to_input(self, history: list[dict]) -> list[dict]:
+        """
+        将前端发来的简单历史（{role, content} 字符串对）转换为 Responses API input 格式。
+        用户消息：直接使用。
+        助手消息：包装为 output_text 格式（Responses API 要求）。
+        """
+        input_items = []
+        for msg in history:
+            if msg["role"] == "user":
+                input_items.append({"role": "user", "content": msg["content"]})
+            elif msg["role"] == "assistant" and msg.get("content"):
+                # Responses API 助手消息格式
+                input_items.append({
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": msg["content"]}],
+                })
+        return input_items
+
+    async def _compress(self, input_items: list) -> list:
+        """压缩对话上下文（s06），返回压缩后的 input_items。"""
         TRANSCRIPT_DIR.mkdir(exist_ok=True)
         path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-        with open(path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
-        conv_text = json.dumps(messages, default=str, ensure_ascii=False)[:80000]
-        response = self.client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"请总结以下对话以便继续工作（保留关键决策、待办事项和上下文）：\n{conv_text}",
-                }
-            ],
-            max_tokens=2000,
+        path.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False, default=str) for item in input_items),
+            encoding="utf-8",
         )
-        summary = response.choices[0].message.content or "(压缩摘要)"
+        conv_text = json.dumps(input_items, ensure_ascii=False, default=str)[:80000]
+        response = await self.client.responses.create(
+            model=MODEL,
+            input=[{
+                "role": "user",
+                "content": f"请总结以下对话以便继续工作（保留关键决策、待办和上下文）：\n{conv_text}",
+            }],
+            max_output_tokens=2000,
+        )
+        summary = ""
+        for item in response.output:
+            if item.type == "message":
+                for c in item.content:
+                    if hasattr(c, "text"):
+                        summary += c.text
         return [
             {"role": "user", "content": f"[上下文已压缩，原始记录：{path}]\n{summary}"},
-            {"role": "assistant", "content": "已理解压缩摘要，继续工作。"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "已理解压缩摘要，继续工作。"}]},
         ]
 
-    async def run(
-        self, user_message: str, history: list[dict], emit: Callable
-    ) -> AsyncIterator[None]:
+    async def run(self, user_message: str, history: list[dict], emit: Callable) -> list[dict]:
         """
-        运行 Agent 循环。
-        emit(event_dict) 将事件发送给前端（SSE）。
+        运行 Agent 循环（Responses API）。
+        emit(event_dict) 将事件推送给前端（SSE）。
+        返回更新后的简单历史列表（供前端下次发送）。
         """
         await self._ensure_mcp()
 
         # 绑定团队事件回调
         self.team.event_callback = emit
 
-        messages = list(history)
-        messages.append({"role": "user", "content": user_message})
+        # 构建 Responses API input（含历史）
+        input_items = self._convert_history_to_input(history)
+        input_items.append({"role": "user", "content": user_message})
 
         tools = self._build_tools()
         system_prompt = self._build_system_prompt()
@@ -546,153 +573,179 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
         emit({"type": "agent_start"})
 
         rounds_without_todo = 0
-        max_iterations = 30
+        final_text = ""
 
-        for iteration in range(max_iterations):
+        for iteration in range(30):
             # s08：注入后台任务通知
             notifs = self.bg.drain()
             if notifs:
-                txt = "\n".join(
+                notif_text = "\n".join(
                     f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
                 )
-                messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
-                messages.append({"role": "assistant", "content": "已收到后台任务结果。"})
-
-            # s09：检查收件箱
-            inbox = self.bus.read_inbox("lead")
-            if inbox:
-                messages.append(
-                    {"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2, ensure_ascii=False)}</inbox>"}
-                )
-                messages.append({"role": "assistant", "content": "已查看收件箱。"})
-
-            # s06：token 估算 + 自动压缩
-            if estimate_tokens(messages) > TOKEN_THRESHOLD:
-                emit({"type": "system_event", "event": "auto_compact", "message": "上下文已自动压缩"})
-                messages = await self._compress(messages)
-
-            # 调用 LLM
-            response = self.client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": system_prompt}] + messages,
-                tools=tools,
-                max_tokens=4000,
-                stream=True,
-            )
-
-            # 收集流式响应
-            full_content = ""
-            tool_calls_raw: dict[int, dict] = {}
-
-            for chunk in response:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if not delta:
-                    continue
-
-                # 流式文本
-                if delta.content:
-                    full_content += delta.content
-                    emit({"type": "message_delta", "content": delta.content})
-
-                # 流式工具调用
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tool_calls_raw:
-                            tool_calls_raw[idx] = {
-                                "id": tc_delta.id or "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        if tc_delta.id:
-                            tool_calls_raw[idx]["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_calls_raw[idx]["function"]["name"] += tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tool_calls_raw[idx]["function"]["arguments"] += tc_delta.function.arguments
-
-            finish_reason = chunk.choices[0].finish_reason if chunk.choices else "stop"
-
-            # 构建 assistant 消息
-            tool_calls_list = [tool_calls_raw[i] for i in sorted(tool_calls_raw.keys())]
-            assistant_msg: dict = {"role": "assistant", "content": full_content or None}
-            if tool_calls_list:
-                assistant_msg["tool_calls"] = tool_calls_list
-            messages.append(assistant_msg)
-
-            if finish_reason != "tool_calls" or not tool_calls_list:
-                if full_content:
-                    emit({"type": "message_done", "content": full_content})
-                break
-
-            # 执行工具调用
-            used_todo = False
-            manual_compress = False
-            tool_results = []
-
-            for tc in tool_calls_list:
-                fn_name = tc["function"]["name"]
-                fn_id = tc["id"]
-                try:
-                    fn_args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
-                except json.JSONDecodeError:
-                    fn_args = {}
-
-                # 判断工具类型
-                tool_type = "builtin"
-                if self.mcp and self.mcp.is_mcp_tool(fn_name):
-                    tool_type = "mcp"
-                elif fn_name == "load_skill":
-                    tool_type = "skill"
-
-                emit({
-                    "type": "tool_call",
-                    "id": fn_id,
-                    "name": fn_name,
-                    "tool_type": tool_type,
-                    "input": fn_args,
+                input_items.append({
+                    "role": "user",
+                    "content": f"<background-results>\n{notif_text}\n</background-results>",
                 })
 
-                # 分发工具
+            # s09：检查 lead 收件箱
+            inbox = self.bus.read_inbox("lead")
+            if inbox:
+                input_items.append({
+                    "role": "user",
+                    "content": f"<inbox>{json.dumps(inbox, indent=2, ensure_ascii=False)}</inbox>",
+                })
+
+            # s06：token 估算 + 自动压缩
+            if estimate_tokens(input_items) > TOKEN_THRESHOLD:
+                emit({"type": "system_event", "event": "auto_compact", "message": "上下文已自动压缩"})
+                input_items = await self._compress(input_items)
+
+            # ===== 流式调用 Responses API =====
+            turn_content = ""
+            pending_tool_calls: dict[str, dict] = {}  # call_id -> {id, name, args_buffer}
+            manual_compress = False
+            used_todo = False
+
+            try:
+                async with self.client.responses.stream(
+                    model=MODEL,
+                    input=input_items,
+                    instructions=system_prompt,
+                    tools=tools,
+                ) as stream:
+                    async for event in stream:
+                        etype = event.type
+
+                        # 文本流
+                        if etype == "response.output_text.delta":
+                            turn_content += event.delta
+                            emit({"type": "message_delta", "content": event.delta})
+
+                        # 新的输出项（function_call 出现时）
+                        elif etype == "response.output_item.added":
+                            item = event.item
+                            if getattr(item, "type", None) == "function_call":
+                                pending_tool_calls[item.call_id] = {
+                                    "id": getattr(item, "id", item.call_id),
+                                    "name": item.name,
+                                    "call_id": item.call_id,
+                                    "args_buffer": "",
+                                }
+
+                        # 函数参数流
+                        elif etype == "response.function_call_arguments.delta":
+                            if event.call_id in pending_tool_calls:
+                                pending_tool_calls[event.call_id]["args_buffer"] += event.delta
+
+                        # 函数参数完成 → emit tool_call
+                        elif etype == "response.function_call_arguments.done":
+                            if event.call_id in pending_tool_calls:
+                                tc = pending_tool_calls[event.call_id]
+                                try:
+                                    tc["parsed_args"] = json.loads(event.arguments)
+                                except Exception:
+                                    tc["parsed_args"] = {}
+
+                                fn_name = tc["name"]
+                                tool_type = "builtin"
+                                if self.mcp and self.mcp.is_mcp_tool(fn_name):
+                                    tool_type = "mcp"
+                                elif fn_name == "load_skill":
+                                    tool_type = "skill"
+
+                                emit({
+                                    "type": "tool_call",
+                                    "id": tc["call_id"],
+                                    "name": fn_name,
+                                    "tool_type": tool_type,
+                                    "input": tc["parsed_args"],
+                                })
+
+                    final_response = stream.get_final_response()
+
+            except Exception as e:
+                emit({"type": "error", "message": f"API 调用失败: {e}"})
+                break
+
+            # ===== 将响应输出追加到 input_items（供下轮使用）=====
+            tool_calls_this_turn = []
+            for item in final_response.output:
+                if item.type == "message":
+                    # 文本消息（turn_content 已在流式中积累）
+                    input_items.append({
+                        "id": item.id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": turn_content}],
+                    })
+                elif item.type == "function_call":
+                    input_items.append({
+                        "type": "function_call",
+                        "id": item.id,
+                        "call_id": item.call_id,
+                        "name": item.name,
+                        "arguments": item.arguments,
+                    })
+                    tool_calls_this_turn.append(item)
+
+            # 没有工具调用 → 本轮结束
+            if not tool_calls_this_turn:
+                final_text = turn_content
+                if turn_content:
+                    emit({"type": "message_done", "content": turn_content})
+                break
+
+            # ===== 执行工具调用 =====
+            for item in tool_calls_this_turn:
+                fn_name = item.name
                 try:
-                    output = await self._dispatch_tool(fn_name, fn_args)
-                except Exception as e:
-                    output = f"工具执行错误: {e}"
+                    fn_args = json.loads(item.arguments) if item.arguments else {}
+                except Exception:
+                    fn_args = {}
 
                 if fn_name == "TodoWrite":
                     used_todo = True
                 if fn_name == "compress":
                     manual_compress = True
 
+                try:
+                    output = await self._dispatch_tool(fn_name, fn_args)
+                except Exception as e:
+                    output = f"工具执行错误: {e}"
+
+                is_error = str(output).startswith(("错误", "Error", "工具执行错误"))
                 emit({
                     "type": "tool_result",
-                    "id": fn_id,
+                    "id": item.call_id,
                     "name": fn_name,
                     "content": str(output)[:2000],
-                    "error": str(output).startswith("错误") or str(output).startswith("Error"),
+                    "error": is_error,
                 })
 
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": fn_id,
-                    "content": str(output)[:50000],
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": item.call_id,
+                    "output": str(output)[:50000],
                 })
-
-            messages.extend(tool_results)
 
             # s03：Todo nag
             rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
             if self.todo.has_open_items() and rounds_without_todo >= 3:
-                messages.append({"role": "user", "content": "<reminder>请更新你的 Todo 列表。</reminder>"})
+                input_items.append({"role": "user", "content": "<reminder>请更新你的 Todo 列表。</reminder>"})
 
             # 手动压缩
             if manual_compress:
                 emit({"type": "system_event", "event": "manual_compact", "message": "上下文已手动压缩"})
-                messages = await self._compress(messages)
+                input_items = await self._compress(input_items)
 
         emit({"type": "done"})
-        return messages
+
+        # 返回更新后的简单历史（用户消息 + 最终文本回答）
+        updated_history = list(history)
+        updated_history.append({"role": "user", "content": user_message})
+        if final_text:
+            updated_history.append({"role": "assistant", "content": final_text})
+        return updated_history
 
     async def _dispatch_tool(self, fn_name: str, fn_args: dict) -> str:
         """分发工具调用到对应处理函数。"""
@@ -701,71 +754,44 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             return await self.mcp.call_tool(fn_name, fn_args)
 
         # 内置工具
-        if fn_name == "bash":
-            return run_bash(fn_args["command"])
-        elif fn_name == "read_file":
-            return run_read(fn_args["path"], fn_args.get("limit"))
-        elif fn_name == "write_file":
-            return run_write(fn_args["path"], fn_args["content"])
-        elif fn_name == "edit_file":
-            return run_edit(fn_args["path"], fn_args["old_text"], fn_args["new_text"])
-        elif fn_name == "TodoWrite":
+        handlers = {
+            "bash":             lambda: run_bash(fn_args["command"]),
+            "read_file":        lambda: run_read(fn_args["path"], fn_args.get("limit")),
+            "write_file":       lambda: run_write(fn_args["path"], fn_args["content"]),
+            "edit_file":        lambda: run_edit(fn_args["path"], fn_args["old_text"], fn_args["new_text"]),
+            "task_create":      lambda: self.task_mgr.create(fn_args["subject"], fn_args.get("description", "")),
+            "task_get":         lambda: self.task_mgr.get(fn_args["task_id"]),
+            "task_update":      lambda: self.task_mgr.update(fn_args["task_id"], fn_args.get("status"), fn_args.get("add_blocked_by"), fn_args.get("add_blocks")),
+            "task_list":        lambda: self.task_mgr.list_all(),
+            "background_run":   lambda: self.bg.run(fn_args["command"], fn_args.get("timeout", 120)),
+            "check_background": lambda: self.bg.check(fn_args.get("task_id")),
+            "list_teammates":   lambda: self.team.list_all(),
+            "read_inbox":       lambda: json.dumps(self.bus.read_inbox("lead"), indent=2, ensure_ascii=False),
+            "broadcast":        lambda: self.bus.broadcast("lead", fn_args["content"], self.team.member_names()),
+            "shutdown_request": lambda: self.team.request_shutdown(fn_args["teammate"]),
+            "plan_approval":    lambda: self.team.approve_plan(fn_args["request_id"], fn_args["approve"], fn_args.get("feedback", "")),
+            "send_message":     lambda: self.bus.send("lead", fn_args["to"], fn_args["content"], fn_args.get("msg_type", "message")),
+            "compress":         lambda: "压缩中...",
+            "load_skill":       lambda: self.skills.load(fn_args["name"]),
+        }
+
+        if fn_name == "TodoWrite":
             try:
                 return self.todo.update(fn_args["items"])
             except ValueError as e:
                 return f"错误: {e}"
-        elif fn_name == "load_skill":
-            return self.skills.load(fn_args["name"])
-        elif fn_name == "task_create":
-            return self.task_mgr.create(fn_args["subject"], fn_args.get("description", ""))
-        elif fn_name == "task_get":
-            return self.task_mgr.get(fn_args["task_id"])
-        elif fn_name == "task_update":
-            return self.task_mgr.update(
-                fn_args["task_id"],
-                fn_args.get("status"),
-                fn_args.get("add_blocked_by"),
-                fn_args.get("add_blocks"),
-            )
-        elif fn_name == "task_list":
-            return self.task_mgr.list_all()
-        elif fn_name == "background_run":
-            return self.bg.run(fn_args["command"], fn_args.get("timeout", 120))
-        elif fn_name == "check_background":
-            return self.bg.check(fn_args.get("task_id"))
-        elif fn_name == "spawn_teammate":
+
+        if fn_name == "spawn_teammate":
             return self.team.spawn(
-                fn_args["name"],
-                fn_args["role"],
-                fn_args["prompt"],
-                self.client,
+                fn_args["name"], fn_args["role"], fn_args["prompt"],
+                None,  # 传 None，team_manager 内部自己创建同步客户端
                 MODEL,
             )
-        elif fn_name == "list_teammates":
-            return self.team.list_all()
-        elif fn_name == "send_message":
-            return self.bus.send(
-                "lead",
-                fn_args["to"],
-                fn_args["content"],
-                fn_args.get("msg_type", "message"),
-            )
-        elif fn_name == "read_inbox":
-            return json.dumps(self.bus.read_inbox("lead"), indent=2, ensure_ascii=False)
-        elif fn_name == "broadcast":
-            return self.bus.broadcast("lead", fn_args["content"], self.team.member_names())
-        elif fn_name == "shutdown_request":
-            return self.team.request_shutdown(fn_args["teammate"])
-        elif fn_name == "plan_approval":
-            return self.team.approve_plan(
-                fn_args["request_id"],
-                fn_args["approve"],
-                fn_args.get("feedback", ""),
-            )
-        elif fn_name == "compress":
-            return "压缩中..."
-        else:
-            return f"未知工具: {fn_name}"
+
+        handler = handlers.get(fn_name)
+        if handler:
+            return handler()
+        return f"未知工具: {fn_name}"
 
 
 # 全局单例（在 FastAPI 应用中复用）

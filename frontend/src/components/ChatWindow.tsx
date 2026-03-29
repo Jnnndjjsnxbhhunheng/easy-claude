@@ -22,6 +22,8 @@ export function ChatWindow() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<(() => void) | null>(null);
+  // 长对话记忆：后端返回的 history_update 存在这里，下次请求时作为 history 发送
+  const conversationHistoryRef = useRef<{ role: string; content: string }[]>([]);
 
   // 加载配置
   useEffect(() => {
@@ -49,10 +51,9 @@ export function ChatWindow() {
   }, [input]);
 
   const buildHistory = useCallback(() => {
-    return messages
-      .filter((m) => m.role === "user" || (m.role === "assistant" && m.content))
-      .map((m) => ({ role: m.role, content: m.content }));
-  }, [messages]);
+    // 优先使用后端返回的 history（包含长对话记忆）
+    return conversationHistoryRef.current;
+  }, []);
 
   const sendMessage = useCallback(async () => {
     const text = input.trim();
@@ -149,6 +150,13 @@ export function ChatWindow() {
 
             case "done":
               updateAssistantMsg({ streaming: false, steps: [...accSteps] });
+              break;
+
+            case "history_update":
+              // 后端返回完整 history，保存以供下次请求（长对话记忆）
+              if (Array.isArray((event as { type: string; history?: unknown[] }).history)) {
+                conversationHistoryRef.current = (event as { type: string; history: { role: string; content: string }[] }).history;
+              }
               break;
 
             default:

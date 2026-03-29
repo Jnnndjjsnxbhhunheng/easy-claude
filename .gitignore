@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.tasks/
+.team/
+.transcripts/
+.worktrees/
+node_modules/
+.next/

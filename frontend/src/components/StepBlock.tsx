@@ -23,7 +23,8 @@ export type AgentEvent =
   | { type: "message_delta"; content: string }
   | { type: "message_done"; content: string }
   | { type: "error"; message: string }
-  | { type: "done" };
+  | { type: "done" }
+  | { type: "history_update"; history: { role: string; content: string }[] };
 
 interface StepBlockProps {
   event: AgentEvent;

@@ -1,6 +1,7 @@
 """
-Skill 加载器（s05 模式）
+Skill 加载器（s05 模式）— Responses API 版本
 扫描 skills/ 目录，解析 SKILL.md 的 YAML frontmatter，按需加载完整内容。
+工具定义使用 Responses API 格式（name 在顶层）。
 """
 import re
 from pathlib import Path
@@ -46,23 +47,21 @@ class SkillLoader:
         return list(self.skills.keys())
 
     def as_openai_tool(self) -> dict:
-        """将 load_skill 暴露为 OpenAI function calling 工具。"""
+        """将 load_skill 暴露为 Responses API 工具（name 在顶层）。"""
         skill_names = self.list_names()
         return {
             "type": "function",
-            "function": {
-                "name": "load_skill",
-                "description": "按名称加载专项技能的完整内容，注入到对话上下文中",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "enum": skill_names if skill_names else ["(无技能)"],
-                            "description": "要加载的技能名称",
-                        }
-                    },
-                    "required": ["name"],
+            "name": "load_skill",
+            "description": "按名称加载专项技能的完整内容，注入到对话上下文中",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": skill_names if skill_names else ["(无技能)"],
+                        "description": "要加载的技能名称",
+                    }
                 },
+                "required": ["name"],
             },
         }
