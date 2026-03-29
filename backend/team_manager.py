@@ -255,6 +255,14 @@ class TeamManager:
                 instructions=sys_prompt,
                 tools=_TEAMMATE_TOOLS,
             )
+            if isinstance(response, str):
+                text = response
+                if text:
+                    input_items.append({
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    })
+                return text, []
             text = ""
             calls = []
             for item in response.output:

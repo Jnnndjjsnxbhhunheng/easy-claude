@@ -59,9 +59,13 @@ async def chat(req: ChatRequest):
 
         def emit(event: dict):
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.run_coroutine_threadsafe(event_queue.put(event), loop)
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+
+                if loop is not None:
+                    event_queue.put_nowait(event)
                 else:
                     event_queue.put_nowait(event)
             except Exception as e:

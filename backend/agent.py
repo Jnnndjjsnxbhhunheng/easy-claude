@@ -26,10 +26,36 @@ WORKDIR = Path(__file__).parent.parent
 TASKS_DIR = WORKDIR / ".tasks"
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
-SKILLS_DIR = Path(os.environ.get("SKILLS_DIR", str(WORKDIR / "skills")))
+_skills_dir = Path(os.environ.get("SKILLS_DIR", str(WORKDIR / "skills")))
+SKILLS_DIR = _skills_dir if _skills_dir.is_absolute() else (WORKDIR / _skills_dir).resolve()
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOKEN_THRESHOLD = 80000
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+
+
+def is_retryable_api_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    retry_markers = (
+        "503",
+        "service temporarily unavailable",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection error",
+    )
+    return any(marker in text for marker in retry_markers)
+
+
+def extract_output_text(response) -> str:
+    parts: list[str] = []
+    for item in getattr(response, "output", []):
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", []):
+            text = getattr(content, "text", None)
+            if text:
+                parts.append(text)
+    return "".join(parts)
 
 
 # ===== 工具函数 =====
@@ -494,6 +520,66 @@ class AgentRunner:
 
         return tools
 
+    def _select_tools(self, user_message: str) -> list[dict]:
+        """按用户当前意图裁剪工具，降低兼容网关在大工具集上的失败率。"""
+        all_tools = self._build_tools()
+        by_name = {tool["name"]: tool for tool in all_tools}
+        selected: list[str] = []
+        lowered = user_message.lower()
+
+        def add(*names: str):
+            for name in names:
+                if name in by_name and name not in selected:
+                    selected.append(name)
+
+        if "skill" in lowered or "技能" in user_message:
+            add("load_skill")
+        for skill_name in self.skills.list_names():
+            if skill_name.lower() in lowered:
+                add("load_skill")
+                break
+
+        if any(token in user_message for token in ("计算", "当前时间", "时间")):
+            add("calculate", "get_current_time")
+        if "search_files" in lowered or any(token in user_message for token in ("搜索文件", "查找文件", "glob")):
+            add("search_files")
+
+        if "任务" in user_message or "task" in lowered:
+            add("task_create", "task_get", "task_update", "task_list")
+        if "todo" in lowered or "待办" in user_message:
+            add("TodoWrite")
+
+        if any(token in user_message for token in ("队友", "团队")) or any(
+            token in lowered for token in ("teammate", "spawn_teammate", "broadcast")
+        ):
+            add(
+                "spawn_teammate",
+                "list_teammates",
+                "send_message",
+                "read_inbox",
+                "broadcast",
+                "shutdown_request",
+                "plan_approval",
+            )
+
+        if any(token in user_message for token in ("命令", "shell", "工作目录")) or "bash" in lowered:
+            add("bash")
+        if any(token in user_message for token in ("读取文件", "查看文件")) or "read_file" in lowered:
+            add("read_file")
+        if any(token in user_message for token in ("写入文件", "编辑文件", "修改文件")) or any(
+            token in lowered for token in ("write_file", "edit_file")
+        ):
+            add("read_file", "write_file", "edit_file")
+        if "后台" in user_message or "background" in lowered:
+            add("background_run", "check_background")
+        if "压缩" in user_message or "compress" in lowered:
+            add("compress")
+
+        # 普通对话默认不附带工具，优先保证兼容网关稳定返回。
+        if not selected:
+            return []
+        return [by_name[name] for name in selected]
+
     def _build_system_prompt(self) -> str:
         return f"""你是一个全功能 AI Agent，工作目录：{WORKDIR}。
 
@@ -567,7 +653,7 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
         input_items = self._convert_history_to_input(history)
         input_items.append({"role": "user", "content": user_message})
 
-        tools = self._build_tools()
+        tools = self._select_tools(user_message)
         system_prompt = self._build_system_prompt()
 
         emit({"type": "agent_start"})
@@ -602,70 +688,131 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
 
             # ===== 流式调用 Responses API =====
             turn_content = ""
-            pending_tool_calls: dict[str, dict] = {}  # call_id -> {id, name, args_buffer}
+            pending_tool_calls: dict[str, dict] = {}  # item_id -> {id, call_id, name, args_buffer}
             manual_compress = False
             used_todo = False
 
-            try:
-                async with self.client.responses.stream(
-                    model=MODEL,
-                    input=input_items,
-                    instructions=system_prompt,
-                    tools=tools,
-                ) as stream:
-                    async for event in stream:
-                        etype = event.type
+            final_response = None
+            last_api_error = None
+            used_non_stream_fallback = False
+            for api_attempt in range(3):
+                try:
+                    async with asyncio.timeout(20):
+                        async with self.client.responses.stream(
+                            model=MODEL,
+                            input=input_items,
+                            instructions=system_prompt,
+                            tools=tools,
+                        ) as stream:
+                            async for event in stream:
+                                etype = event.type
 
-                        # 文本流
-                        if etype == "response.output_text.delta":
-                            turn_content += event.delta
-                            emit({"type": "message_delta", "content": event.delta})
+                                # 文本流
+                                if etype == "response.output_text.delta":
+                                    turn_content += event.delta
+                                    emit({"type": "message_delta", "content": event.delta})
 
-                        # 新的输出项（function_call 出现时）
-                        elif etype == "response.output_item.added":
-                            item = event.item
-                            if getattr(item, "type", None) == "function_call":
-                                pending_tool_calls[item.call_id] = {
-                                    "id": getattr(item, "id", item.call_id),
-                                    "name": item.name,
-                                    "call_id": item.call_id,
-                                    "args_buffer": "",
-                                }
+                                # 新的输出项（function_call 出现时）
+                                elif etype == "response.output_item.added":
+                                    item = event.item
+                                    if getattr(item, "type", None) == "function_call":
+                                        pending_tool_calls[item.id] = {
+                                            "id": getattr(item, "id", item.call_id),
+                                            "name": item.name,
+                                            "call_id": item.call_id,
+                                            "args_buffer": "",
+                                        }
 
-                        # 函数参数流
-                        elif etype == "response.function_call_arguments.delta":
-                            if event.call_id in pending_tool_calls:
-                                pending_tool_calls[event.call_id]["args_buffer"] += event.delta
+                                # 函数参数流
+                                elif etype == "response.function_call_arguments.delta":
+                                    item_id = getattr(event, "item_id", None)
+                                    if item_id in pending_tool_calls:
+                                        pending_tool_calls[item_id]["args_buffer"] += event.delta
 
-                        # 函数参数完成 → emit tool_call
-                        elif etype == "response.function_call_arguments.done":
-                            if event.call_id in pending_tool_calls:
-                                tc = pending_tool_calls[event.call_id]
-                                try:
-                                    tc["parsed_args"] = json.loads(event.arguments)
-                                except Exception:
-                                    tc["parsed_args"] = {}
+                                # 函数参数完成 → emit tool_call
+                                elif etype == "response.function_call_arguments.done":
+                                    item_id = getattr(event, "item_id", None)
+                                    if item_id in pending_tool_calls:
+                                        tc = pending_tool_calls[item_id]
+                                        try:
+                                            tc["parsed_args"] = json.loads(event.arguments)
+                                        except Exception:
+                                            tc["parsed_args"] = {}
 
-                                fn_name = tc["name"]
-                                tool_type = "builtin"
-                                if self.mcp and self.mcp.is_mcp_tool(fn_name):
-                                    tool_type = "mcp"
-                                elif fn_name == "load_skill":
-                                    tool_type = "skill"
+                                        fn_name = tc["name"]
+                                        tool_type = "builtin"
+                                        if self.mcp and self.mcp.is_mcp_tool(fn_name):
+                                            tool_type = "mcp"
+                                        elif fn_name == "load_skill":
+                                            tool_type = "skill"
 
-                                emit({
-                                    "type": "tool_call",
-                                    "id": tc["call_id"],
-                                    "name": fn_name,
-                                    "tool_type": tool_type,
-                                    "input": tc["parsed_args"],
-                                })
+                                        emit({
+                                            "type": "tool_call",
+                                            "id": tc["call_id"],
+                                            "name": fn_name,
+                                            "tool_type": tool_type,
+                                            "input": tc["parsed_args"],
+                                        })
 
-                    final_response = stream.get_final_response()
+                            final_response = await stream.get_final_response()
+                    break
+                except Exception as e:
+                    last_api_error = e
+                    if api_attempt < 2 and is_retryable_api_error(e):
+                        emit({
+                            "type": "system_event",
+                            "event": "api_retry",
+                            "message": f"上游模型服务暂时不可用，正在重试（{api_attempt + 1}/2）",
+                        })
+                        await asyncio.sleep(1 + api_attempt)
+                        continue
+                    break
 
-            except Exception as e:
-                emit({"type": "error", "message": f"API 调用失败: {e}"})
+            if final_response is None and last_api_error and is_retryable_api_error(last_api_error):
+                emit({
+                    "type": "system_event",
+                    "event": "stream_fallback",
+                    "message": "流式响应不可用，已切换为非流式模式继续执行",
+                })
+                try:
+                    async with asyncio.timeout(20):
+                        final_response = await self.client.responses.create(
+                            model=MODEL,
+                            input=input_items,
+                            instructions=system_prompt,
+                            tools=tools,
+                        )
+                    used_non_stream_fallback = True
+                    turn_content = extract_output_text(final_response)
+                except Exception as e:
+                    last_api_error = e
+
+            if final_response is None:
+                emit({"type": "error", "message": f"API 调用失败: {last_api_error}"})
                 break
+
+            if used_non_stream_fallback:
+                for item in final_response.output:
+                    if item.type != "function_call":
+                        continue
+                    try:
+                        parsed_args = json.loads(item.arguments) if item.arguments else {}
+                    except Exception:
+                        parsed_args = {}
+
+                    tool_type = "builtin"
+                    if self.mcp and self.mcp.is_mcp_tool(item.name):
+                        tool_type = "mcp"
+                    elif item.name == "load_skill":
+                        tool_type = "skill"
+
+                    emit({
+                        "type": "tool_call",
+                        "id": item.call_id,
+                        "name": item.name,
+                        "tool_type": tool_type,
+                        "input": parsed_args,
+                    })
 
             # ===== 将响应输出追加到 input_items（供下轮使用）=====
             tool_calls_this_turn = []

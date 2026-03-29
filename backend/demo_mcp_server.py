@@ -3,11 +3,10 @@
 内置演示 MCP 服务器
 提供三个示例工具：calculate / get_current_time / search_files
 """
-import asyncio
 import glob
 import math
-import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -15,7 +14,7 @@ from mcp.types import Tool, TextContent
 
 app = Server("demo-mcp-server")
 
-WORKDIR = os.getcwd()
+WORKDIR = Path(__file__).parent.parent
 
 SAFE_MATH_NAMES = {
     k: v for k, v in vars(math).items() if not k.startswith("_")
@@ -95,4 +94,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 if __name__ == "__main__":
-    asyncio.run(stdio_server(app))
+    import anyio
+
+    async def main():
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options(),
+            )
+
+    anyio.run(main)
