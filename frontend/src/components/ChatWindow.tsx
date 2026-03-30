@@ -5,7 +5,29 @@ import { Send, Square, Bot, Zap, BookOpen, Settings } from "lucide-react";
 import { MessageBubble, ChatMessage } from "./MessageBubble";
 import { AgentEvent } from "./StepBlock";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "";
+const CONFIGURED_BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL?.trim() || "";
+const BACKEND_CANDIDATES = [
+  CONFIGURED_BACKEND_URL,
+  "",
+  "http://127.0.0.1:8012",
+  "http://127.0.0.1:8015",
+  "http://127.0.0.1:8000",
+].filter((value, index, array) => value && array.indexOf(value) === index);
+
+async function probeBackend(baseUrl: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 1500);
+  try {
+    const res = await fetch(`${baseUrl}/api/config`, {
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
 
 interface ConfigData {
   model: string;
@@ -19,6 +41,7 @@ export function ChatWindow() {
   const [streaming, setStreaming] = useState(false);
   const [config, setConfig] = useState<ConfigData | null>(null);
   const [showConfig, setShowConfig] = useState(false);
+  const [backendUrl, setBackendUrl] = useState(CONFIGURED_BACKEND_URL);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<(() => void) | null>(null);
@@ -27,10 +50,32 @@ export function ChatWindow() {
 
   // 加载配置
   useEffect(() => {
-    fetch(`${BACKEND_URL}/api/config`)
-      .then((r) => r.json())
-      .then(setConfig)
-      .catch(console.error);
+    let cancelled = false;
+
+    const loadConfig = async () => {
+      for (const candidate of BACKEND_CANDIDATES) {
+        const isAvailable = await probeBackend(candidate);
+        if (!isAvailable) continue;
+
+        try {
+          const res = await fetch(`${candidate}/api/config`);
+          if (!res.ok) continue;
+          const data = (await res.json()) as ConfigData;
+          if (!cancelled) {
+            setBackendUrl(candidate);
+            setConfig(data);
+          }
+          return;
+        } catch {
+          // Continue probing other candidates.
+        }
+      }
+    };
+
+    void loadConfig();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // 自动滚动到底部
@@ -90,7 +135,7 @@ export function ChatWindow() {
 
     try {
       const history = buildHistory();
-      const res = await fetch(`${BACKEND_URL}/api/chat`, {
+      const res = await fetch(`${backendUrl}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, history }),
@@ -173,7 +218,7 @@ export function ChatWindow() {
       setStreaming(false);
       inputRef.current?.focus();
     }
-  }, [input, streaming, buildHistory]);
+  }, [backendUrl, input, streaming, buildHistory]);
 
   const stopStreaming = useCallback(() => {
     abortRef.current?.();

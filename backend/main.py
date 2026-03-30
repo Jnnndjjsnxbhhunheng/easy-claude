@@ -144,7 +144,8 @@ async def chat(req: ChatRequest):
 
         async def run_agent():
             try:
-                updated_history, _ = await _run_agent_and_collect(req.message, history_dicts)
+                agent = get_agent()
+                updated_history = await agent.run(req.message, history_dicts, emit)
                 # 通知前端更新历史（长对话记忆）
                 emit({
                     "type": "history_update",
