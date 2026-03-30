@@ -1,4 +1,5 @@
 .env
+.env.local
 __pycache__/
 *.pyc
 .tasks/
@@ -7,3 +8,7 @@ __pycache__/
 .worktrees/
 node_modules/
 .next/
+.DS_Store
+.artifacts/
+tmp/
+frontend/.env.local

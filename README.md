@@ -93,6 +93,36 @@ easy-claude/
 MCP_SERVERS=[{"name":"my-server","command":"python","args":["/path/to/server.py"]}]
 ```
 
+### Brand Ranking MCP Bridge
+
+如果你已经在本机启动了 `ranking_mcp_service.py`，可以把 brand-ranking 所需的 MCP bridge 加到 `MCP_SERVERS`：
+
+```bash
+RANKING_MCP_BASE_URL=http://127.0.0.1:8000
+RANKING_MCP_TIMEOUT_SECONDS=30
+# 可选：本地服务如果需要鉴权再设置
+# RANKING_MCP_BEARER_TOKEN=
+# RANKING_MCP_API_KEY=
+# RANKING_MCP_API_KEY_HEADER=X-API-Key
+
+MCP_SERVERS=[
+  {"name":"demo","command":"python","args":["backend/demo_mcp_server.py"]},
+  {"name":"ranking","command":"python","args":["backend/ranking_mcp_bridge.py"]}
+]
+```
+
+接入后会新增 `brand-ranking` skill 和以下 canonical MCP 工具：
+
+- `ranking_query_understanding`
+- `ranking_ugc_search_aiapi`
+- `ranking_ugc_search_uiapi`
+- `ranking_hotsell_recall`
+- `ranking_bmc_detail_enrich`
+- `ranking_sh_detail_enrich`
+- `ranking_brand_normalize`
+
+兼容期内，`ranking.*` 和旧的 `mcp__ranking__*` 名字仍可调用，但只作为 deprecated aliases，不再作为主文档和 skill 名字使用。
+
 ## 添加 Skill
 
 在 `skills/` 目录创建新文件夹，添加 `SKILL.md`：

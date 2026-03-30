@@ -31,9 +31,18 @@ SKILLS_DIR = _skills_dir if _skills_dir.is_absolute() else (WORKDIR / _skills_di
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOKEN_THRESHOLD = 80000
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+DEFAULT_MODEL_TIMEOUT_SECONDS = 20
+LONG_WORKFLOW_MODEL_TIMEOUT_SECONDS = 300
+TOOL_OUTPUT_CONTEXT_LIMITS = {
+    "load_skill": 18000,
+    "read_file": 12000,
+    "default": 12000,
+}
 
 
 def is_retryable_api_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError | asyncio.TimeoutError):
+        return True
     text = str(exc).lower()
     retry_markers = (
         "503",
@@ -42,11 +51,47 @@ def is_retryable_api_error(exc: Exception) -> bool:
         "timeout",
         "connection reset",
         "connection error",
+        "didn't receive a `response.completed` event",
     )
     return any(marker in text for marker in retry_markers)
 
 
+def is_missing_response_completed_error(exc: Exception) -> bool:
+    return "didn't receive a `response.completed` event" in str(exc).lower()
+
+
+def format_api_error(exc: Exception, timeout_seconds: int) -> str:
+    if isinstance(exc, TimeoutError | asyncio.TimeoutError):
+        return f"模型调用超时（{timeout_seconds}s）"
+
+    text = str(exc).strip()
+    if text:
+        return f"API 调用失败: {text}"
+
+    exc_name = exc.__class__.__name__ or "UnknownError"
+    return f"API 调用失败: {exc_name}"
+
+
 def extract_output_text(response) -> str:
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        output = response.get("output", [])
+        if isinstance(output, str):
+            return output
+        parts: list[str] = []
+        for item in output:
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                text = content.get("text")
+                if text:
+                    parts.append(text)
+        if parts:
+            return "".join(parts)
+        return response.get("output_text", "") or response.get("text", "") or json.dumps(
+            response, ensure_ascii=False
+        )
     parts: list[str] = []
     for item in getattr(response, "output", []):
         if getattr(item, "type", None) != "message":
@@ -116,6 +161,13 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 def estimate_tokens(messages: list) -> int:
     return len(json.dumps(messages, default=str)) // 4
+
+
+def truncate_tool_output_for_context(fn_name: str, output: str) -> str:
+    limit = TOOL_OUTPUT_CONTEXT_LIMITS.get(fn_name, TOOL_OUTPUT_CONTEXT_LIMITS["default"])
+    if len(output) <= limit:
+        return output
+    return f"{output[:limit]}\n... [已截断，原始输出过长]"
 
 
 def _to_responses_tool(chat_tool: dict) -> dict:
@@ -520,10 +572,9 @@ class AgentRunner:
 
         return tools
 
-    def _select_tools(self, user_message: str) -> list[dict]:
-        """按用户当前意图裁剪工具，降低兼容网关在大工具集上的失败率。"""
-        all_tools = self._build_tools()
-        by_name = {tool["name"]: tool for tool in all_tools}
+    def _base_tool_names(self, user_message: str) -> list[str]:
+        """按用户当前意图保留最小基础工具集，不在这里做任何 skill 专属拍板。"""
+        by_name = {tool["name"]: tool for tool in self._build_tools()}
         selected: list[str] = []
         lowered = user_message.lower()
 
@@ -532,12 +583,7 @@ class AgentRunner:
                 if name in by_name and name not in selected:
                     selected.append(name)
 
-        if "skill" in lowered or "技能" in user_message:
-            add("load_skill")
-        for skill_name in self.skills.list_names():
-            if skill_name.lower() in lowered:
-                add("load_skill")
-                break
+        add("load_skill")
 
         if any(token in user_message for token in ("计算", "当前时间", "时间")):
             add("calculate", "get_current_time")
@@ -575,22 +621,185 @@ class AgentRunner:
         if "压缩" in user_message or "compress" in lowered:
             add("compress")
 
-        # 普通对话默认不附带工具，优先保证兼容网关稳定返回。
-        if not selected:
-            return []
+        # 允许用户直接按工具名点名调用，但不为任意 skill 做关键词特判。
+        for name in by_name:
+            if name == "load_skill":
+                continue
+            if name.lower() in lowered:
+                add(name)
+
+        return selected
+
+    def _select_tools(self, user_message: str, loaded_skills: set[str] | None = None) -> list[dict]:
+        """基础工具裁剪 + 已加载 skill 驱动的增量能力开放。"""
+        all_tools = self._build_tools()
+        by_name = {tool["name"]: tool for tool in all_tools}
+        selected: list[str] = []
+        loaded_skills = loaded_skills or set()
+
+        def add(*names: str):
+            for name in names:
+                if name in by_name and name not in selected:
+                    selected.append(name)
+
+        add(*self._base_tool_names(user_message))
+
+        for skill_name in loaded_skills:
+            profile = self.skills.get_profile(skill_name)
+            for tool_name in profile.get("mentioned_tools", []):
+                add(tool_name)
+            if profile.get("referenced_files"):
+                add("read_file")
+            if profile.get("executable_files"):
+                add("bash")
+
         return [by_name[name] for name in selected]
 
     def _build_system_prompt(self) -> str:
         return f"""你是一个全功能 AI Agent，工作目录：{WORKDIR}。
 
 使用工具完成任务。优先使用 task_create/task_list 管理多步骤工作，用 TodoWrite 管理短清单。
-需要专项知识时使用 load_skill 加载技能。
+先根据用户请求和下方 skill 描述，自主判断是否需要调用 load_skill 加载专项技能。
+`load_skill` 只会提供该 skill 的 `SKILL.md` 入口说明，不会自动展开整个 skill 目录。
+若 `SKILL.md` 中引用了相对路径文件，必须按该 skill 自身目录解析这些相对路径，而不是按仓库根目录解析。
+读取或执行 skill 附件时，优先直接使用 `SKILL.md` 里写出的相对路径；系统会把这些相对路径解析到已加载 skill 的真实目录。
+如果 `SKILL.md` 明确引用了其他附件文件，只读取当前步骤真正需要的那些文件。
+如果 `SKILL.md` 明确引用了脚本或可执行文件，只在当前步骤需要时再运行。
+一旦某个 skill 已加载，就必须遵守它在 `SKILL.md` 中写明的 Required / Optional、必读 / 必跑、workflow step 约束；不要跳过被标为必需的读取或执行步骤。
+不要因为 skill 目录里还有其他文件就批量读取或执行。
 
 可用技能：
 {self.skills.descriptions()}
 
 MCP 工具可直接调用（来自外部 MCP 服务器）。
 生成队友时使用 spawn_teammate，队友执行风险操作前需提交计划审批。"""
+
+    def _model_timeout_seconds(self, loaded_skills: set[str]) -> int:
+        return LONG_WORKFLOW_MODEL_TIMEOUT_SECONDS if loaded_skills else DEFAULT_MODEL_TIMEOUT_SECONDS
+
+    def _loaded_skill_attachment_specs(self, loaded_skills: set[str]) -> list[tuple[str, Path]]:
+        specs: list[tuple[str, Path]] = []
+        for skill_name in loaded_skills:
+            skill_dir = self.skills.get_dir(skill_name)
+            if skill_dir is None:
+                continue
+            profile = self.skills.get_profile(skill_name)
+            rel_paths = list(profile.get("referenced_files", []))
+            rel_paths.extend(profile.get("executable_files", []))
+            rel_paths.extend(profile.get("resource_hints", {}).get("other_files", []))
+            for rel_path in rel_paths:
+                actual = (skill_dir / rel_path).resolve()
+                if actual.exists() and actual.is_file():
+                    specs.append((rel_path, actual))
+        return specs
+
+    def _resolve_loaded_skill_path(self, requested_path: str, loaded_skills: set[str]) -> Path | None:
+        if not loaded_skills:
+            return None
+
+        normalized_requested = requested_path.replace("\\", "/")
+        basename = Path(normalized_requested).name
+        basename_matches: list[Path] = []
+
+        for skill_name, actual in self._iter_skill_attachment_aliases(loaded_skills):
+            alias = skill_name.replace("\\", "/")
+            if normalized_requested == alias or normalized_requested.endswith(f"/{alias}"):
+                return Path(actual)
+            if Path(alias).name == basename:
+                basename_matches.append(Path(actual))
+
+        unique_matches = []
+        for match in basename_matches:
+            if match not in unique_matches:
+                unique_matches.append(match)
+        if len(unique_matches) == 1:
+            return unique_matches[0]
+        return None
+
+    def _iter_skill_attachment_aliases(self, loaded_skills: set[str]) -> list[tuple[str, str]]:
+        aliases: list[tuple[str, str]] = []
+        basename_counts: dict[str, int] = {}
+        specs = self._loaded_skill_attachment_specs(loaded_skills)
+        for rel_path, actual in specs:
+            basename_counts[Path(rel_path).name] = basename_counts.get(Path(rel_path).name, 0) + 1
+
+        for skill_name in loaded_skills:
+            skill_dir = self.skills.get_dir(skill_name)
+            if skill_dir is None:
+                continue
+            for rel_path, actual in specs:
+                if not str(actual).startswith(str(skill_dir)):
+                    continue
+                actual_str = actual.as_posix()
+                alias_values = [
+                    rel_path,
+                    f"{skill_name}/{rel_path}",
+                    f"skills/{skill_name}/{rel_path}",
+                    (WORKDIR / skill_name / rel_path).as_posix(),
+                    actual_str,
+                ]
+                if basename_counts.get(Path(rel_path).name) == 1:
+                    alias_values.append(Path(rel_path).name)
+                for alias in alias_values:
+                    aliases.append((alias, actual_str))
+
+        aliases.sort(key=lambda item: len(item[0]), reverse=True)
+        return aliases
+
+    def _run_read_for_loaded_skills(
+        self,
+        path: str,
+        limit: int | None,
+        loaded_skills: set[str],
+    ) -> str:
+        output = run_read(path, limit)
+        if not str(output).startswith("错误"):
+            return output
+        resolved = self._resolve_loaded_skill_path(path, loaded_skills)
+        if resolved is None:
+            return output
+        return run_read(resolved.as_posix(), limit)
+
+    def _rewrite_bash_command_for_loaded_skills(
+        self,
+        command: str,
+        loaded_skills: set[str],
+    ) -> str:
+        rewritten = command
+        for alias, actual in self._iter_skill_attachment_aliases(loaded_skills):
+            if not alias or alias == actual:
+                continue
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_./-]){re.escape(alias)}(?![A-Za-z0-9_./-])"
+            )
+            rewritten = pattern.sub(actual, rewritten)
+        return rewritten
+
+    def _build_loaded_skill_followup(self, skill_name: str) -> str:
+        skill_dir = self.skills.get_dir(skill_name)
+        profile = self.skills.get_profile(skill_name)
+        if skill_dir is None:
+            return ""
+
+        lines = [
+            f"<loaded-skill name=\"{skill_name}\">",
+            f"skill_root={skill_dir.as_posix()}",
+        ]
+        referenced_files = profile.get("referenced_files", [])
+        executable_files = profile.get("executable_files", [])
+        mentioned_tools = profile.get("mentioned_tools", [])
+
+        if referenced_files:
+            lines.append("referenced_files=" + ", ".join(referenced_files))
+        if executable_files:
+            lines.append("executable_files=" + ", ".join(executable_files))
+        if mentioned_tools:
+            lines.append("mentioned_tools=" + ", ".join(mentioned_tools))
+
+        lines.append("规则：后续读取或执行这些附件时，直接使用上面的相对路径即可，系统会按 skill_root 解析。")
+        lines.append("规则：若 SKILL.md 将某些读取、脚本或工具步骤标为 Required/必读/必跑/mandatory，完成这些步骤后才能结束。")
+        lines.append("</loaded-skill>")
+        return "\n".join(lines)
 
     def _convert_history_to_input(self, history: list[dict]) -> list[dict]:
         """
@@ -627,12 +836,7 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             }],
             max_output_tokens=2000,
         )
-        summary = ""
-        for item in response.output:
-            if item.type == "message":
-                for c in item.content:
-                    if hasattr(c, "text"):
-                        summary += c.text
+        summary = extract_output_text(response)
         return [
             {"role": "user", "content": f"[上下文已压缩，原始记录：{path}]\n{summary}"},
             {"role": "assistant", "content": [{"type": "output_text", "text": "已理解压缩摘要，继续工作。"}]},
@@ -653,7 +857,8 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
         input_items = self._convert_history_to_input(history)
         input_items.append({"role": "user", "content": user_message})
 
-        tools = self._select_tools(user_message)
+        loaded_skills: set[str] = set()
+        tools = self._select_tools(user_message, loaded_skills)
         system_prompt = self._build_system_prompt()
 
         emit({"type": "agent_start"})
@@ -682,7 +887,8 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
                 })
 
             # s06：token 估算 + 自动压缩
-            if estimate_tokens(input_items) > TOKEN_THRESHOLD:
+            compact_threshold = TOKEN_THRESHOLD * 2 if loaded_skills else TOKEN_THRESHOLD
+            if estimate_tokens(input_items) > compact_threshold:
                 emit({"type": "system_event", "event": "auto_compact", "message": "上下文已自动压缩"})
                 input_items = await self._compress(input_items)
 
@@ -695,9 +901,11 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             final_response = None
             last_api_error = None
             used_non_stream_fallback = False
+            force_non_stream_fallback = False
+            model_timeout_seconds = self._model_timeout_seconds(loaded_skills)
             for api_attempt in range(3):
                 try:
-                    async with asyncio.timeout(20):
+                    async with asyncio.timeout(model_timeout_seconds):
                         async with self.client.responses.stream(
                             model=MODEL,
                             input=input_items,
@@ -758,6 +966,9 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
                     break
                 except Exception as e:
                     last_api_error = e
+                    if is_missing_response_completed_error(e):
+                        force_non_stream_fallback = True
+                        break
                     if api_attempt < 2 and is_retryable_api_error(e):
                         emit({
                             "type": "system_event",
@@ -768,14 +979,21 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
                         continue
                     break
 
-            if final_response is None and last_api_error and is_retryable_api_error(last_api_error):
+            if final_response is None and last_api_error and (
+                force_non_stream_fallback or is_retryable_api_error(last_api_error)
+            ):
+                fallback_message = (
+                    "流式响应尾事件缺失，已自动补刷为非流式继续完成"
+                    if force_non_stream_fallback
+                    else "流式响应不可用，已切换为非流式模式继续执行"
+                )
                 emit({
                     "type": "system_event",
                     "event": "stream_fallback",
-                    "message": "流式响应不可用，已切换为非流式模式继续执行",
+                    "message": fallback_message,
                 })
                 try:
-                    async with asyncio.timeout(20):
+                    async with asyncio.timeout(model_timeout_seconds):
                         final_response = await self.client.responses.create(
                             model=MODEL,
                             input=input_items,
@@ -788,7 +1006,10 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
                     last_api_error = e
 
             if final_response is None:
-                emit({"type": "error", "message": f"API 调用失败: {last_api_error}"})
+                emit({
+                    "type": "error",
+                    "message": format_api_error(last_api_error, model_timeout_seconds),
+                })
                 break
 
             if used_non_stream_fallback:
@@ -843,6 +1064,7 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
                 break
 
             # ===== 执行工具调用 =====
+            tools_changed = False
             for item in tool_calls_this_turn:
                 fn_name = item.name
                 try:
@@ -856,29 +1078,43 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
                     manual_compress = True
 
                 try:
-                    output = await self._dispatch_tool(fn_name, fn_args)
+                    output = await self._dispatch_tool(fn_name, fn_args, loaded_skills)
                 except Exception as e:
                     output = f"工具执行错误: {e}"
 
-                is_error = str(output).startswith(("错误", "Error", "工具执行错误"))
+                output_text = str(output)
+                context_output = truncate_tool_output_for_context(fn_name, output_text)
+                is_error = output_text.startswith(("错误", "Error", "工具执行错误"))
                 emit({
                     "type": "tool_result",
                     "id": item.call_id,
                     "name": fn_name,
-                    "content": str(output)[:2000],
+                    "content": output_text[:2000],
                     "error": is_error,
                 })
 
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": item.call_id,
-                    "output": str(output)[:50000],
+                    "output": context_output,
                 })
+
+                if fn_name == "load_skill":
+                    skill_name = str(fn_args.get("name", "")).strip()
+                    if skill_name in self.skills.list_names() and skill_name not in loaded_skills:
+                        loaded_skills.add(skill_name)
+                        tools_changed = True
+                        followup = self._build_loaded_skill_followup(skill_name)
+                        if followup:
+                            input_items.append({"role": "user", "content": followup})
 
             # s03：Todo nag
             rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
             if self.todo.has_open_items() and rounds_without_todo >= 3:
                 input_items.append({"role": "user", "content": "<reminder>请更新你的 Todo 列表。</reminder>"})
+
+            if tools_changed:
+                tools = self._select_tools(user_message, loaded_skills)
 
             # 手动压缩
             if manual_compress:
@@ -894,7 +1130,7 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             updated_history.append({"role": "assistant", "content": final_text})
         return updated_history
 
-    async def _dispatch_tool(self, fn_name: str, fn_args: dict) -> str:
+    async def _dispatch_tool(self, fn_name: str, fn_args: dict, loaded_skills: set[str]) -> str:
         """分发工具调用到对应处理函数。"""
         # MCP 工具
         if self.mcp and self.mcp.is_mcp_tool(fn_name):
@@ -902,8 +1138,12 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
 
         # 内置工具
         handlers = {
-            "bash":             lambda: run_bash(fn_args["command"]),
-            "read_file":        lambda: run_read(fn_args["path"], fn_args.get("limit")),
+            "bash":             lambda: run_bash(
+                self._rewrite_bash_command_for_loaded_skills(fn_args["command"], loaded_skills)
+            ),
+            "read_file":        lambda: self._run_read_for_loaded_skills(
+                fn_args["path"], fn_args.get("limit"), loaded_skills
+            ),
             "write_file":       lambda: run_write(fn_args["path"], fn_args["content"]),
             "edit_file":        lambda: run_edit(fn_args["path"], fn_args["old_text"], fn_args["new_text"]),
             "task_create":      lambda: self.task_mgr.create(fn_args["subject"], fn_args.get("description", "")),

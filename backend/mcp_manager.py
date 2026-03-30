@@ -41,7 +41,12 @@ class MCPManager:
                 if resolved.exists():
                     args = [str(resolved)] + list(args[1:])
 
-            params = StdioServerParameters(command=command, args=args)
+            params = StdioServerParameters(
+                command=command,
+                args=args,
+                env=dict(os.environ),
+                cwd=str(Path(__file__).parent.parent),
+            )
             try:
                 ctx = stdio_client(params)
                 read, write = await ctx.__aenter__()
