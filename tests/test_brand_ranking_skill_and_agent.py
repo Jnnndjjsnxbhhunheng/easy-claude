@@ -17,7 +17,10 @@ from agent import (
     AgentRunner,
     DEFAULT_MODEL_TIMEOUT_SECONDS,
     LONG_WORKFLOW_MODEL_TIMEOUT_SECONDS,
+    COMPRESSED_STATE_END,
+    COMPRESSED_STATE_START,
     extract_output_text,
+    extract_compressed_state,
     format_api_error,
     is_missing_response_completed_error,
     is_retryable_api_error,
@@ -302,6 +305,88 @@ class AgentSkillToolExpansionTests(unittest.TestCase):
             runner._model_timeout_seconds({"brand-ranking"}),
             LONG_WORKFLOW_MODEL_TIMEOUT_SECONDS,
         )
+
+    def test_extract_compressed_state_reads_structured_payload(self):
+        payload = (
+            "prefix\n"
+            f"{COMPRESSED_STATE_START}\n"
+            '{'
+            '"original_user_goal":"冷热龙头品牌排行榜",'
+            '"completed_steps":["step 4"],'
+            '"remaining_steps":["step 5"],'
+            '"next_required_calls":["merge_hotsell_results.py"],'
+            '"safe_to_finalize":"no"'
+            '}'
+            f"\n{COMPRESSED_STATE_END}\n"
+            "suffix"
+        )
+
+        state = extract_compressed_state(payload)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state["original_user_goal"], "冷热龙头品牌排行榜")
+        self.assertEqual(state["safe_to_finalize"], "no")
+
+    def test_should_block_finalize_when_compressed_state_is_not_safe(self):
+        runner = AgentRunner()
+        input_items = [
+            {
+                "role": "user",
+                "content": (
+                    f"{COMPRESSED_STATE_START}\n"
+                    + json.dumps(
+                        {
+                            "original_user_goal": "冷热龙头品牌排行榜",
+                            "completed_steps": ["step 4"],
+                            "remaining_steps": ["step 5", "step 6"],
+                            "next_required_calls": ["ranking_bmc_detail_enrich"],
+                            "safe_to_finalize": "no",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + f"\n{COMPRESSED_STATE_END}"
+                ),
+            }
+        ]
+
+        self.assertTrue(runner._should_block_finalize(input_items, {"brand-ranking"}))
+
+    def test_should_allow_finalize_when_compressed_state_is_safe(self):
+        runner = AgentRunner()
+        input_items = [
+            {
+                "role": "user",
+                "content": (
+                    f"{COMPRESSED_STATE_START}\n"
+                    + json.dumps(
+                        {
+                            "original_user_goal": "计算结果",
+                            "completed_steps": ["calculate", "get_current_time"],
+                            "remaining_steps": [],
+                            "next_required_calls": [],
+                            "safe_to_finalize": "yes",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + f"\n{COMPRESSED_STATE_END}"
+                ),
+            }
+        ]
+
+        self.assertFalse(runner._should_block_finalize(input_items, set()))
+
+    def test_build_continue_execution_reminder_includes_pending_steps(self):
+        runner = AgentRunner()
+        reminder = runner._build_continue_execution_reminder(
+            {
+                "remaining_steps": ["merge_hotsell_results.py", "check_hotsell_coverage.py"],
+                "next_required_calls": ["ranking_bmc_detail_enrich"],
+            }
+        )
+
+        self.assertIn("remaining_steps", reminder)
+        self.assertIn("merge_hotsell_results.py", reminder)
+        self.assertIn("ranking_bmc_detail_enrich", reminder)
 
 
 class BrandRankingScriptTests(unittest.TestCase):

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,7 +25,24 @@ from agent import get_agent  # noqa: E402
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Easy Claude Agent API — Responses API")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    agent = get_agent()
+    try:
+        await agent._ensure_mcp()
+    except Exception as e:
+        logger.error(f"MCP 启动失败: {e}", exc_info=True)
+    try:
+        yield
+    finally:
+        try:
+            await agent.close()
+        except Exception as e:
+            logger.error(f"Agent 关闭失败: {e}", exc_info=True)
+
+
+app = FastAPI(title="Easy Claude Agent API — Responses API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

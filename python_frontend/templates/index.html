@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Easy Claude - Python Frontend</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-badge">A</div>
+        <div>
+          <h1>Easy Claude</h1>
+          <p>MCP + Skill Agent</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="model-pill" class="model-pill hidden"></span>
+        <button id="config-toggle" class="icon-button" title="查看配置">配置</button>
+        <button id="clear-button" class="ghost-button hidden">清空</button>
+      </div>
+    </header>
+
+    <section id="config-panel" class="config-panel hidden">
+      <div class="config-column">
+        <div class="config-title skill-title">Skills <span id="skill-count">(0)</span></div>
+        <div id="skills-list" class="chip-list"></div>
+      </div>
+      <div class="config-column">
+        <div class="config-title tool-title">MCP 工具 <span id="tool-count">(0)</span></div>
+        <div id="tools-list" class="chip-list"></div>
+      </div>
+    </section>
+
+    <main id="messages-container" class="messages-container">
+      <section id="empty-state" class="empty-state">
+        <div class="empty-icon">A</div>
+        <h2>Easy Claude Agent</h2>
+        <p>支持 MCP 工具调用、Skill 技能加载、多智能体团队协作。所有中间步骤实时可见。</p>
+        <div id="prompt-chips" class="prompt-chip-area"></div>
+        <div id="suggestion-grid" class="suggestion-grid"></div>
+      </section>
+
+      <section id="messages-list" class="messages-list hidden"></section>
+      <div id="messages-end"></div>
+    </main>
+
+    <footer class="composer-wrap">
+      <div class="composer">
+        <textarea id="composer-input" rows="1" placeholder="发送消息… (Enter 发送，Shift+Enter 换行)"></textarea>
+        <button id="send-button" class="send-button" title="发送">发送</button>
+        <button id="stop-button" class="stop-button hidden" title="停止">停止</button>
+      </div>
+      <p class="composer-hint">步骤卡片可点击展开 · 支持 MCP / Skill / 团队协议</p>
+    </footer>
+  </div>
+
+  <!--APP_CONFIG-->
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -45,6 +45,25 @@ npm run dev
 
 打开 http://localhost:3000
 
+### 4. 无 Node.js 的 Python 前端
+
+如果机器不方便安装 Node.js，可以直接使用 Python 版前端。它复刻了当前聊天 UI 的核心行为：
+
+- 后端自动探测
+- SSE 流式展示消息和中间步骤
+- MCP / Skill 配置面板
+- 停止生成、清空历史
+- 长对话 `history_update` 记忆回传
+
+启动方式：
+
+```bash
+cd python_frontend
+python app.py --host 127.0.0.1 --port 3001 --backend-url http://127.0.0.1:8015
+```
+
+打开 http://localhost:3001
+
 ## 项目结构
 
 ```
@@ -68,6 +87,12 @@ easy-claude/
 │           ├── ChatWindow.tsx    # 完整聊天 UI
 │           ├── MessageBubble.tsx # 消息气泡
 │           └── StepBlock.tsx     # 中间步骤卡片
+├── python_frontend/
+│   ├── app.py                    # Python 前端入口
+│   ├── templates/index.html      # 无构建 HTML 页面
+│   └── static/
+│       ├── app.css               # 页面样式
+│       └── app.js                # 前端交互逻辑
 └── .env.example
 ```
 

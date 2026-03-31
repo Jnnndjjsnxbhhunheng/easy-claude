@@ -38,6 +38,8 @@ TOOL_OUTPUT_CONTEXT_LIMITS = {
     "read_file": 12000,
     "default": 12000,
 }
+COMPRESSED_STATE_START = "<compressed-state>"
+COMPRESSED_STATE_END = "</compressed-state>"
 
 
 def is_retryable_api_error(exc: Exception) -> bool:
@@ -168,6 +170,30 @@ def truncate_tool_output_for_context(fn_name: str, output: str) -> str:
     if len(output) <= limit:
         return output
     return f"{output[:limit]}\n... [已截断，原始输出过长]"
+
+
+def extract_compressed_state(text: str) -> dict | None:
+    start = text.find(COMPRESSED_STATE_START)
+    end = text.find(COMPRESSED_STATE_END)
+    if start == -1 or end == -1 or end <= start:
+        return None
+    payload = text[start + len(COMPRESSED_STATE_START):end].strip()
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _normalize_state_items(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return []
 
 
 def _to_responses_tool(chat_tool: dict) -> dict:
@@ -542,6 +568,12 @@ class AgentRunner:
             await self.mcp.initialize()
             self._mcp_initialized = True
 
+    async def close(self):
+        if self.mcp is not None:
+            await self.mcp.close()
+            self.mcp = None
+        self._mcp_initialized = False
+
     def _build_tools(self) -> list[dict]:
         """构建完整工具列表（Responses API 格式）。"""
         tools = _make_builtin_tools()
@@ -667,6 +699,7 @@ class AgentRunner:
 如果 `SKILL.md` 明确引用了脚本或可执行文件，只在当前步骤需要时再运行。
 一旦某个 skill 已加载，就必须遵守它在 `SKILL.md` 中写明的 Required / Optional、必读 / 必跑、workflow step 约束；不要跳过被标为必需的读取或执行步骤。
 不要因为 skill 目录里还有其他文件就批量读取或执行。
+如果上下文压缩后仍存在未完成步骤或 next_required_calls，禁止输出阶段性进度汇报并结束；必须继续执行直到任务完成或明确阻塞。
 
 可用技能：
 {self.skills.descriptions()}
@@ -676,6 +709,12 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
 
     def _model_timeout_seconds(self, loaded_skills: set[str]) -> int:
         return LONG_WORKFLOW_MODEL_TIMEOUT_SECONDS if loaded_skills else DEFAULT_MODEL_TIMEOUT_SECONDS
+
+    def _supports_streaming(self) -> bool:
+        base_url = (os.environ.get("OPENAI_BASE_URL") or "").lower()
+        if "api-vip.codex-for.me" in base_url:
+            return False
+        return True
 
     def _loaded_skill_attachment_specs(self, loaded_skills: set[str]) -> list[tuple[str, Path]]:
         specs: list[tuple[str, Path]] = []
@@ -805,18 +844,14 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
         """
         将前端发来的简单历史（{role, content} 字符串对）转换为 Responses API input 格式。
         用户消息：直接使用。
-        助手消息：包装为 output_text 格式（Responses API 要求）。
+        助手消息：使用纯文本内容，兼容当前上游网关。
         """
         input_items = []
         for msg in history:
             if msg["role"] == "user":
                 input_items.append({"role": "user", "content": msg["content"]})
             elif msg["role"] == "assistant" and msg.get("content"):
-                # Responses API 助手消息格式
-                input_items.append({
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": msg["content"]}],
-                })
+                input_items.append({"role": "assistant", "content": msg["content"]})
         return input_items
 
     async def _compress(self, input_items: list) -> list:
@@ -832,15 +867,96 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             model=MODEL,
             input=[{
                 "role": "user",
-                "content": f"请总结以下对话以便继续工作（保留关键决策、待办和上下文）：\n{conv_text}",
+                "content": (
+                    "请把以下对话压缩成严格结构化的执行状态 JSON，供后续继续执行，不要写散文总结，不要写给用户的话术。\n"
+                    "只允许输出一个 JSON 对象，字段固定为：\n"
+                    "{\n"
+                    '  "original_user_goal": string,\n'
+                    '  "completed_steps": string[],\n'
+                    '  "remaining_steps": string[],\n'
+                    '  "next_required_calls": string[],\n'
+                    '  "safe_to_finalize": "yes" | "no"\n'
+                    "}\n"
+                    "规则：\n"
+                    "- original_user_goal 必须保留原始用户目标，而不是阶段性子目标\n"
+                    "- completed_steps 只写已经完成的关键步骤\n"
+                    "- remaining_steps 只写仍未完成、必须继续做的步骤\n"
+                    "- next_required_calls 只写接下来必须调用的工具、脚本或动作\n"
+                    "- 只要还有 remaining_steps 或 next_required_calls，safe_to_finalize 必须为 no\n"
+                    "- 如果当前只是阶段性进度，safe_to_finalize 必须为 no\n"
+                    f"\n原始对话：\n{conv_text}"
+                ),
             }],
             max_output_tokens=2000,
         )
-        summary = extract_output_text(response)
+        summary = extract_output_text(response).strip()
+        state = extract_compressed_state(
+            f"{COMPRESSED_STATE_START}\n{summary}\n{COMPRESSED_STATE_END}"
+        )
+        if state is None:
+            state = {
+                "original_user_goal": "",
+                "completed_steps": [],
+                "remaining_steps": ["压缩摘要解析失败，需要根据 transcript 恢复上下文并继续执行"],
+                "next_required_calls": ["阅读 transcript 并恢复未完成任务"],
+                "safe_to_finalize": "no",
+            }
+        structured_summary = (
+            f"{COMPRESSED_STATE_START}\n"
+            f"{json.dumps(state, ensure_ascii=False, indent=2)}\n"
+            f"{COMPRESSED_STATE_END}"
+        )
         return [
-            {"role": "user", "content": f"[上下文已压缩，原始记录：{path}]\n{summary}"},
-            {"role": "assistant", "content": [{"type": "output_text", "text": "已理解压缩摘要，继续工作。"}]},
+            {"role": "user", "content": f"[上下文已压缩，原始记录：{path}]\n{structured_summary}"},
+            {"role": "assistant", "content": "已理解压缩摘要，继续工作。"},
+            {
+                "role": "user",
+                "content": (
+                    "你仍在同一任务中。若上面的 safe_to_finalize != yes，"
+                    "必须继续执行 remaining_steps 和 next_required_calls，"
+                    "禁止输出阶段性汇报并结束。"
+                ),
+            },
         ]
+
+    def _latest_compressed_state(self, input_items: list) -> dict | None:
+        for item in reversed(input_items):
+            content = item.get("content") if isinstance(item, dict) else None
+            if isinstance(content, str):
+                state = extract_compressed_state(content)
+                if state is not None:
+                    return state
+        return None
+
+    def _build_continue_execution_reminder(self, state: dict | None) -> str:
+        if not state:
+            return (
+                "当前任务尚未明确完成。禁止输出阶段性进度汇报并结束，"
+                "请继续调用必要工具完成用户请求。"
+            )
+        remaining_steps = _normalize_state_items(state.get("remaining_steps"))
+        next_required_calls = _normalize_state_items(state.get("next_required_calls"))
+        lines = [
+            "当前任务尚未完成。禁止输出阶段性进度汇报并结束，必须继续执行。",
+        ]
+        if remaining_steps:
+            lines.append("remaining_steps: " + " | ".join(remaining_steps[:8]))
+        if next_required_calls:
+            lines.append("next_required_calls: " + " | ".join(next_required_calls[:8]))
+        return "\n".join(lines)
+
+    def _should_block_finalize(self, input_items: list, loaded_skills: set[str]) -> bool:
+        state = self._latest_compressed_state(input_items)
+        if state is None:
+            return False
+        safe_to_finalize = str(state.get("safe_to_finalize", "")).strip().lower()
+        remaining_steps = _normalize_state_items(state.get("remaining_steps"))
+        next_required_calls = _normalize_state_items(state.get("next_required_calls"))
+        if safe_to_finalize != "yes":
+            return True
+        if loaded_skills and (remaining_steps or next_required_calls):
+            return True
+        return False
 
     async def run(self, user_message: str, history: list[dict], emit: Callable) -> list[dict]:
         """
@@ -903,81 +1019,100 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             used_non_stream_fallback = False
             force_non_stream_fallback = False
             model_timeout_seconds = self._model_timeout_seconds(loaded_skills)
-            for api_attempt in range(3):
+            if self._supports_streaming():
+                for api_attempt in range(3):
+                    try:
+                        async with asyncio.timeout(model_timeout_seconds):
+                            async with self.client.responses.stream(
+                                model=MODEL,
+                                input=input_items,
+                                instructions=system_prompt,
+                                tools=tools,
+                            ) as stream:
+                                async for event in stream:
+                                    etype = event.type
+
+                                    # 文本流
+                                    if etype == "response.output_text.delta":
+                                        turn_content += event.delta
+                                        emit({"type": "message_delta", "content": event.delta})
+
+                                    # 新的输出项（function_call 出现时）
+                                    elif etype == "response.output_item.added":
+                                        item = event.item
+                                        if getattr(item, "type", None) == "function_call":
+                                            pending_tool_calls[item.id] = {
+                                                "id": getattr(item, "id", item.call_id),
+                                                "name": item.name,
+                                                "call_id": item.call_id,
+                                                "args_buffer": "",
+                                            }
+
+                                    # 函数参数流
+                                    elif etype == "response.function_call_arguments.delta":
+                                        item_id = getattr(event, "item_id", None)
+                                        if item_id in pending_tool_calls:
+                                            pending_tool_calls[item_id]["args_buffer"] += event.delta
+
+                                    # 函数参数完成 → emit tool_call
+                                    elif etype == "response.function_call_arguments.done":
+                                        item_id = getattr(event, "item_id", None)
+                                        if item_id in pending_tool_calls:
+                                            tc = pending_tool_calls[item_id]
+                                            try:
+                                                tc["parsed_args"] = json.loads(event.arguments)
+                                            except Exception:
+                                                tc["parsed_args"] = {}
+
+                                            fn_name = tc["name"]
+                                            tool_type = "builtin"
+                                            if self.mcp and self.mcp.is_mcp_tool(fn_name):
+                                                tool_type = "mcp"
+                                            elif fn_name == "load_skill":
+                                                tool_type = "skill"
+
+                                            emit({
+                                                "type": "tool_call",
+                                                "id": tc["call_id"],
+                                                "name": fn_name,
+                                                "tool_type": tool_type,
+                                                "input": tc["parsed_args"],
+                                            })
+
+                                final_response = await stream.get_final_response()
+                        break
+                    except Exception as e:
+                        last_api_error = e
+                        if is_missing_response_completed_error(e):
+                            force_non_stream_fallback = True
+                            break
+                        if api_attempt < 2 and is_retryable_api_error(e):
+                            emit({
+                                "type": "system_event",
+                                "event": "api_retry",
+                                "message": f"上游模型服务暂时不可用，正在重试（{api_attempt + 1}/2）",
+                            })
+                            await asyncio.sleep(1 + api_attempt)
+                            continue
+                        break
+            else:
+                emit({
+                    "type": "system_event",
+                    "event": "stream_disabled",
+                    "message": "当前上游网关不兼容流式 Responses，已自动切换为非流式模式",
+                })
                 try:
                     async with asyncio.timeout(model_timeout_seconds):
-                        async with self.client.responses.stream(
+                        final_response = await self.client.responses.create(
                             model=MODEL,
                             input=input_items,
                             instructions=system_prompt,
                             tools=tools,
-                        ) as stream:
-                            async for event in stream:
-                                etype = event.type
-
-                                # 文本流
-                                if etype == "response.output_text.delta":
-                                    turn_content += event.delta
-                                    emit({"type": "message_delta", "content": event.delta})
-
-                                # 新的输出项（function_call 出现时）
-                                elif etype == "response.output_item.added":
-                                    item = event.item
-                                    if getattr(item, "type", None) == "function_call":
-                                        pending_tool_calls[item.id] = {
-                                            "id": getattr(item, "id", item.call_id),
-                                            "name": item.name,
-                                            "call_id": item.call_id,
-                                            "args_buffer": "",
-                                        }
-
-                                # 函数参数流
-                                elif etype == "response.function_call_arguments.delta":
-                                    item_id = getattr(event, "item_id", None)
-                                    if item_id in pending_tool_calls:
-                                        pending_tool_calls[item_id]["args_buffer"] += event.delta
-
-                                # 函数参数完成 → emit tool_call
-                                elif etype == "response.function_call_arguments.done":
-                                    item_id = getattr(event, "item_id", None)
-                                    if item_id in pending_tool_calls:
-                                        tc = pending_tool_calls[item_id]
-                                        try:
-                                            tc["parsed_args"] = json.loads(event.arguments)
-                                        except Exception:
-                                            tc["parsed_args"] = {}
-
-                                        fn_name = tc["name"]
-                                        tool_type = "builtin"
-                                        if self.mcp and self.mcp.is_mcp_tool(fn_name):
-                                            tool_type = "mcp"
-                                        elif fn_name == "load_skill":
-                                            tool_type = "skill"
-
-                                        emit({
-                                            "type": "tool_call",
-                                            "id": tc["call_id"],
-                                            "name": fn_name,
-                                            "tool_type": tool_type,
-                                            "input": tc["parsed_args"],
-                                        })
-
-                            final_response = await stream.get_final_response()
-                    break
+                        )
+                    used_non_stream_fallback = True
+                    turn_content = extract_output_text(final_response)
                 except Exception as e:
                     last_api_error = e
-                    if is_missing_response_completed_error(e):
-                        force_non_stream_fallback = True
-                        break
-                    if api_attempt < 2 and is_retryable_api_error(e):
-                        emit({
-                            "type": "system_event",
-                            "event": "api_retry",
-                            "message": f"上游模型服务暂时不可用，正在重试（{api_attempt + 1}/2）",
-                        })
-                        await asyncio.sleep(1 + api_attempt)
-                        continue
-                    break
 
             if final_response is None and last_api_error and (
                 force_non_stream_fallback or is_retryable_api_error(last_api_error)
@@ -1040,12 +1175,7 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
             for item in final_response.output:
                 if item.type == "message":
                     # 文本消息（turn_content 已在流式中积累）
-                    input_items.append({
-                        "id": item.id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": turn_content}],
-                    })
+                    input_items.append({"role": "assistant", "content": turn_content})
                 elif item.type == "function_call":
                     input_items.append({
                         "type": "function_call",
@@ -1058,6 +1188,18 @@ MCP 工具可直接调用（来自外部 MCP 服务器）。
 
             # 没有工具调用 → 本轮结束
             if not tool_calls_this_turn:
+                if self._should_block_finalize(input_items, loaded_skills):
+                    state = self._latest_compressed_state(input_items)
+                    emit({
+                        "type": "system_event",
+                        "event": "continue_required",
+                        "message": "检测到压缩后仍有未完成步骤，继续执行而不是阶段性收尾",
+                    })
+                    input_items.append({
+                        "role": "user",
+                        "content": self._build_continue_execution_reminder(state),
+                    })
+                    continue
                 final_text = turn_content
                 if turn_content:
                     emit({"type": "message_done", "content": turn_content})

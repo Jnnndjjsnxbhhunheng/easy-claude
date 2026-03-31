@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -24,11 +25,14 @@ class MCPManager:
         self._tools: list[dict] = []           # Responses API 格式
         self._tool_to_server: dict[str, str] = {}
         self._sessions: dict[str, ClientSession] = {}
-        self._contexts: list = []
+        self._exit_stack = AsyncExitStack()
         self._initialized = False
 
     async def initialize(self):
         """启动所有 MCP 服务器并获取工具列表。"""
+        if self._initialized:
+            return
+
         for config in self.server_configs:
             name = config["name"]
             command = config["command"]
@@ -48,12 +52,8 @@ class MCPManager:
                 cwd=str(Path(__file__).parent.parent),
             )
             try:
-                ctx = stdio_client(params)
-                read, write = await ctx.__aenter__()
-                self._contexts.append((ctx, name))
-
-                session = ClientSession(read, write)
-                await session.__aenter__()
+                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+                session = await self._exit_stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
                 self._sessions[name] = session
 
@@ -112,16 +112,19 @@ class MCPManager:
         return tool_name in self._tool_to_server
 
     async def close(self):
-        for _, session in self._sessions.items():
-            try:
-                await session.__aexit__(None, None, None)
-            except Exception:
-                pass
-        for ctx, _ in self._contexts:
-            try:
-                await ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
+        if not self._initialized and not self._sessions:
+            return
+
+        try:
+            await self._exit_stack.aclose()
+        except Exception as e:
+            logger.error(f"MCP 关闭失败: {e}")
+        finally:
+            self._tools.clear()
+            self._tool_to_server.clear()
+            self._sessions.clear()
+            self._exit_stack = AsyncExitStack()
+            self._initialized = False
 
 
 def load_mcp_configs() -> list[dict]:
